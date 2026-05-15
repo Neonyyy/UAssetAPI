@@ -229,6 +229,15 @@ namespace UAssetAPI
         public string FilePath;
 
         /// <summary>
+        /// Optional list of additional directories to search when attempting to resolve dependency assets referenced by this asset.
+        /// Each entry should be an absolute path to a directory that may serve as a project root, a Content directory, or any
+        /// ancestor thereof. <see cref="FindAssetOnDiskFromPath"/> will try both project-mount (/Game/) and plugin-mount layouts
+        /// underneath these directories. Defaults to an empty list; callers may populate it to widen the on-disk search.
+        /// </summary>
+        [JsonIgnore]
+        public IList<string> AdditionalSearchDirectories = new List<string>();
+
+        /// <summary>
         /// Whether this asset is only being parsed to extract schemas for parsing a different asset.
         /// </summary>
         [JsonIgnore]
@@ -671,42 +680,140 @@ namespace UAssetAPI
         }
 
         /// <summary>
-        /// Attempt to find another asset on disk given an asset path (i.e. one starting with /Game/).
+        /// Attempt to find another asset on disk given an asset path (e.g. /Game/Foo/Bar or /MyPlugin/Foo/Bar).
+        /// Searches the directory containing <see cref="FilePath"/>, the project Content layout (/Game/...),
+        /// the plugin-mount layout (/&lt;PluginName&gt;/... mapped to &lt;Project&gt;/Plugins/&lt;PluginName&gt;/Content/...),
+        /// and any user-supplied <see cref="AdditionalSearchDirectories"/>.
         /// </summary>
         /// <param name="path">The asset path.</param>
         /// <returns>The path to the file on disk, or null if none could be found.</returns>
         public virtual string FindAssetOnDiskFromPath(string path)
         {
+            if (string.IsNullOrEmpty(path)) return null;
             if (!path.StartsWith("/") || path.StartsWith("/Script")) return null;
-            path = path.Substring(6) + ".uasset";
 
-            string mappedPathOnDisk = string.Empty;
-            bool foundMappedPath = false;
+            // generic mount-point strip: drop the leading "/<MountName>/" so any mount works (not just /Game/).
+            // e.g. "/panda_framework_script/levelscript-actor/Foo" -> mountName="panda_framework_script", remainder="levelscript-actor/Foo"
+            string mountName = null;
+            string remainder = null;
+            int secondSlash = path.IndexOf('/', 1);
+            if (secondSlash > 1 && secondSlash < path.Length - 1)
+            {
+                mountName = path.Substring(1, secondSlash - 1);
+                remainder = path.Substring(secondSlash + 1) + ".uasset";
+            }
+            else
+            {
+                // no mount segment to strip; fall back to using the whole tail
+                remainder = path.Substring(1) + ".uasset";
+            }
 
-            var contentPart = Path.DirectorySeparatorChar + "Content";
+            string remainderOnDisk = remainder.FixDirectorySeparatorsForDisk();
+            string fullRelativeOnDisk = (mountName != null ? (mountName + "/" + remainder) : remainder).FixDirectorySeparatorsForDisk();
+            string rawFileName = Path.GetFileName(remainderOnDisk);
+
+            // 1) same directory as FilePath, basename only — covers the user's "copy the file next to the asset" workflow
             if (!string.IsNullOrEmpty(FilePath))
             {
-                var fixedFilePath = FilePath.FixDirectorySeparatorsForDisk();
-                var contentIndex = fixedFilePath.LastIndexOf(contentPart);
-
-                // let's see if the current path has Content in it, then we can re-orient ourselves
-                if (!foundMappedPath && contentIndex > 0)
+                try
                 {
-                    var contentDir = fixedFilePath.Substring(0, contentIndex + contentPart.Length);
-                    mappedPathOnDisk = Path.Combine(contentDir, path.FixDirectorySeparatorsForDisk());
-                    foundMappedPath = File.Exists(mappedPathOnDisk); // not worrying too much about race condition, we'll put a try catch later
+                    var parent = Directory.GetParent(FilePath);
+                    if (parent != null)
+                    {
+                        string candidate = Path.Combine(parent.FullName, rawFileName);
+                        if (SafeFileExists(candidate)) return candidate;
+                    }
                 }
+                catch { /* permissions, missing dir, etc. — keep searching */ }
+            }
 
-                if (!foundMappedPath)
+            // collect candidate roots: ancestors of FilePath, then AdditionalSearchDirectories
+            var candidateRoots = new List<string>();
+            if (!string.IsNullOrEmpty(FilePath))
+            {
+                try
                 {
-                    // let's see if it exists in the same directory
-                    var rawFileName = Path.GetFileName(path);
-                    mappedPathOnDisk = Path.Combine(Directory.GetParent(FilePath).FullName, Path.GetFileName(path));
-                    foundMappedPath = File.Exists(mappedPathOnDisk);
+                    var dir = Directory.GetParent(FilePath);
+                    while (dir != null)
+                    {
+                        candidateRoots.Add(dir.FullName);
+                        dir = dir.Parent;
+                    }
+                }
+                catch { /* keep what we have */ }
+            }
+            if (AdditionalSearchDirectories != null)
+            {
+                foreach (var extra in AdditionalSearchDirectories)
+                {
+                    if (!string.IsNullOrEmpty(extra)) candidateRoots.Add(extra);
                 }
             }
 
-            return foundMappedPath ? mappedPathOnDisk : null;
+            var contentPart = Path.DirectorySeparatorChar + "Content";
+
+            foreach (var root in candidateRoots)
+            {
+                // 2) project-mount layout: <root>/Content/<remainder> when <root> ends in Content,
+                //    or when any ancestor of FilePath ends in Content
+                if (root.EndsWith(contentPart, StringComparison.Ordinal))
+                {
+                    string candidate = Path.Combine(root, remainderOnDisk);
+                    if (SafeFileExists(candidate)) return candidate;
+
+                    // 4) mount-name-as-directory under Content: <root>/Content/<mountName>/<remainder>
+                    if (mountName != null)
+                    {
+                        string candidateMount = Path.Combine(root, fullRelativeOnDisk);
+                        if (SafeFileExists(candidateMount)) return candidateMount;
+                    }
+                }
+
+                // 3) plugin-mount layout: <root>/Plugins/.../<mountName>/Content/<remainder>
+                if (mountName != null)
+                {
+                    string pluginsDir = Path.Combine(root, "Plugins");
+                    if (SafeDirectoryExists(pluginsDir))
+                    {
+                        IEnumerable<string> matches = SafeEnumerateDirectories(pluginsDir, mountName);
+                        if (matches != null)
+                        {
+                            foreach (var pluginRoot in matches)
+                            {
+                                string candidate = Path.Combine(pluginRoot, "Content", remainderOnDisk);
+                                if (SafeFileExists(candidate)) return candidate;
+                            }
+                        }
+                    }
+                }
+
+                // also try a direct join, in case AdditionalSearchDirectories points straight at a Content root
+                if (mountName != null)
+                {
+                    string candidateDirect = Path.Combine(root, fullRelativeOnDisk);
+                    if (SafeFileExists(candidateDirect)) return candidateDirect;
+                }
+                string candidateRemainder = Path.Combine(root, remainderOnDisk);
+                if (SafeFileExists(candidateRemainder)) return candidateRemainder;
+            }
+
+            return null;
+        }
+
+        private static bool SafeFileExists(string p)
+        {
+            try { return !string.IsNullOrEmpty(p) && File.Exists(p); } catch { return false; }
+        }
+
+        private static bool SafeDirectoryExists(string p)
+        {
+            try { return !string.IsNullOrEmpty(p) && Directory.Exists(p); } catch { return false; }
+        }
+
+        private static IEnumerable<string> SafeEnumerateDirectories(string root, string match)
+        {
+            try { return Directory.EnumerateDirectories(root, match, SearchOption.AllDirectories); }
+            catch { return null; }
         }
 
         /// <summary>
@@ -958,6 +1065,11 @@ namespace UAssetAPI
 
         public void ConvertExportToChildExportAndRead(AssetBinaryReader reader, int i, bool read = true)
         {
+            ConvertExportToChildExportAndRead(reader, i, read, false);
+        }
+
+        internal void ConvertExportToChildExportAndRead(AssetBinaryReader reader, int i, bool read, bool retried)
+        {
 #pragma warning disable CS0168 // Variable is declared but never used
             try
             {
@@ -1101,11 +1213,73 @@ namespace UAssetAPI
 #if DEBUGVERBOSE
                 Console.WriteLine("\nFailed to parse export " + (i + 1) + ": " + ex.ToString());
 #endif
+                // Before demoting to RawExport, try once more to pull schemas for any unresolved
+                // class/super/outer imports on this export, then re-parse. This recovers from the
+                // common case where a parent Blueprint's schemas weren't yet in Mappings on the
+                // first attempt (e.g. mutually-referential plugin assets).
+                if (read
+                    && !retried
+                    && Mappings?.Schemas != null
+                    && !IsParsingToPullSchemas
+                    && !CustomSerializationFlags.HasFlag(CustomSerializationFlags.SkipPreloadDependencyLoading))
+                {
+                    int beforeCount = Mappings.Schemas.Count;
+                    TryPullSchemasForExportClassChain(Exports[i]);
+                    if (Mappings.Schemas.Count > beforeCount)
+                    {
+                        try
+                        {
+                            reader.BaseStream.Seek(Exports[i].SerialOffset, SeekOrigin.Begin);
+                            Exports[i].alreadySerialized = false;
+                            ConvertExportToChildExportAndRead(reader, i, read, true);
+                            return;
+                        }
+                        catch
+                        {
+                            // retry also failed; fall through to RawExport demotion
+                        }
+                    }
+                }
+
                 if (read) reader.BaseStream.Seek(Exports[i].SerialOffset, SeekOrigin.Begin);
                 Exports[i] = Exports[i].ConvertToChildExport<RawExport>();
                 if (read) ((RawExport)Exports[i]).Data = reader.ReadBytes((int)Exports[i].SerialSize);
             }
 #pragma warning restore CS0168 // Variable is declared but never used
+        }
+
+        /// <summary>
+        /// Walks the class/super/outer import chain for the given export and attempts to pull schemas
+        /// for any path-shaped import (i.e. one whose ObjectName starts with "/" and isn't "/Script").
+        /// </summary>
+        private void TryPullSchemasForExportClassChain(Export exp)
+        {
+            if (exp == null) return;
+
+            var seen = new HashSet<int>();
+            TryPullSchemasForImportChain(exp.ClassIndex, seen);
+            TryPullSchemasForImportChain(exp.SuperIndex, seen);
+            TryPullSchemasForImportChain(exp.OuterIndex, seen);
+            TryPullSchemasForImportChain(exp.TemplateIndex, seen);
+        }
+
+        private void TryPullSchemasForImportChain(FPackageIndex idx, HashSet<int> seen)
+        {
+            if (idx == null || !idx.IsImport()) return;
+            if (!seen.Add(idx.Index)) return;
+
+            Import imp = idx.ToImport(this);
+            if (imp == null) return;
+
+            string objName = imp.ObjectName?.ToString();
+            if (!string.IsNullOrEmpty(objName)
+                && objName.StartsWith("/")
+                && !objName.StartsWith("/Script"))
+            {
+                PullSchemasFromAnotherAsset(imp.ObjectName);
+            }
+
+            TryPullSchemasForImportChain(imp.OuterIndex, seen);
         }
 
 
@@ -1292,22 +1466,29 @@ namespace UAssetAPI
                 return false;
             }
 
-            // basic circular referencing guard
-            if (Mappings.PathsAlreadyProcessedForSchemas.ContainsKey(assetPath))
+            // two-state guard:
+            //   1 = currently in-progress on this stack (true cyclic recursion)
+            //   2 = completed successfully (memoize, don't reparse)
+            // Failure rolls the entry back so a sibling caller from a different ancestor can retry later.
+            if (Mappings.PathsAlreadyProcessedForSchemas.TryGetValue(assetPath, out byte existingState))
             {
-                return false;
+                if (existingState == 2) return true;
+                if (existingState == 1) return false;
             }
 
+            // propagate AdditionalSearchDirectories so the recursive load can resolve its own deps the same way we did
+            IList<string> propagatedSearchDirs = AdditionalSearchDirectories;
+
             bool success = false;
+            Mappings.PathsAlreadyProcessedForSchemas[assetPath] = 1;
             try
             {
-                Mappings.PathsAlreadyProcessedForSchemas[assetPath] = 1;
-
                 // initial read to just fetch the FolderName
                 UAsset otherAsset = new UAsset(this.ObjectVersion, this.ObjectVersionUE5, this.CustomVersionContainer.Select(item => (CustomVersion)item.Clone()).ToList(), this.Mappings);
                 AssetBinaryReader otherReader = otherAsset.PathToReader(pathOnDisk);
                 otherAsset.CustomSerializationFlags = CustomSerializationFlags.SkipLoadingExports | CustomSerializationFlags.SkipPreloadDependencyLoading;
                 otherAsset.FilePath = pathOnDisk;
+                otherAsset.AdditionalSearchDirectories = propagatedSearchDirs;
                 otherAsset.GameSpecificOverride = GameSpecificOverride;
                 otherAsset.IsParsingToPullSchemas = true;
                 otherAsset.Read(otherReader);
@@ -1328,10 +1509,15 @@ namespace UAssetAPI
                         OtherAssetsFailedToAccess.Add(entry);
                     }
                 }
+
+                success = true;
+                Mappings.PathsAlreadyProcessedForSchemas[assetPath] = 2;
             }
             catch
             {
-                // if we fail to parse the other asset, that's perfectly fine; just move on
+                // if we fail to parse the other asset, roll back the in-progress marker so a future call
+                // from a different parent (where the deps may already be available) can retry.
+                Mappings.PathsAlreadyProcessedForSchemas.TryRemove(assetPath, out _);
                 success = false;
             }
 
@@ -2268,6 +2454,37 @@ namespace UAssetAPI
                         }
 
                         ConvertExportToChildExportAndRead(reader, i);
+                    }
+
+                    // End-of-pass mop-up: any exports demoted to RawExport during the main loop may now be
+                    // recoverable because additional schemas were pulled during later exports' parsing.
+                    // Retry once per such export, gated on the same flags as the in-catch retry.
+                    if (!skipLoadingExports
+                        && !skipParsingExports
+                        && Mappings?.Schemas != null
+                        && !IsParsingToPullSchemas
+                        && !CustomSerializationFlags.HasFlag(CustomSerializationFlags.SkipPreloadDependencyLoading))
+                    {
+                        for (int i = 0; i < Exports.Count; i++)
+                        {
+                            if (manualSkips != null && manualSkips.Contains(i) && (forceReads == null || !forceReads.Contains(i))) continue;
+                            if (Exports[i] is not RawExport) continue;
+
+                            int beforeCount = Mappings.Schemas.Count;
+                            TryPullSchemasForExportClassChain(Exports[i]);
+                            if (Mappings.Schemas.Count <= beforeCount) continue;
+
+                            try
+                            {
+                                reader.BaseStream.Seek(Exports[i].SerialOffset, SeekOrigin.Begin);
+                                Exports[i].alreadySerialized = false;
+                                ConvertExportToChildExportAndRead(reader, i, true, true);
+                            }
+                            catch
+                            {
+                                // give up on this one; existing RawExport bytes remain intact
+                            }
+                        }
                     }
                 }
             }
