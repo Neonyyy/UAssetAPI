@@ -1128,9 +1128,34 @@ namespace UAssetAPI
 #if DEBUGVERBOSE
                 Console.WriteLine("\nFailed to parse export " + (i + 1) + ": " + ex.ToString());
 #endif
+                long nextStarting;
+                if ((Exports.Count - 1) > i)
+                {
+                    nextStarting = Exports[i + 1].SerialOffset;
+                }
+                else
+                {
+                    var uas = (UAsset)reader.Asset;
+                    nextStarting = uas.BulkDataStartOffset;
+                }
+
                 if (read) reader.BaseStream.Seek(Exports[i].SerialOffset, SeekOrigin.Begin);
                 Exports[i] = Exports[i].ConvertToChildExport<RawExport>();
                 if (read) ((RawExport)Exports[i]).Data = reader.ReadBytes((int)Exports[i].SerialSize);
+
+                // Preserve the bytes that follow this export's SerialSize block, up to the next
+                // export's SerialOffset (or BulkDataStartOffset for the last export). The success
+                // path stores these as Extras; the round-trip output is otherwise shorter than
+                // the original and misaligns content the engine reads beyond SerialSize.
+                if (read)
+                {
+                    long extrasLen = nextStarting - reader.BaseStream.Position;
+                    if (extrasLen > 0)
+                    {
+                        Exports[i].Extras = reader.ReadBytes((int)extrasLen);
+                    }
+                    Exports[i].alreadySerialized = true;
+                }
             }
 #pragma warning restore CS0168 // Variable is declared but never used
         }
@@ -1319,17 +1344,20 @@ namespace UAssetAPI
                 return false;
             }
 
-            // basic circular referencing guard
-            if (Mappings.PathsAlreadyProcessedForSchemas.ContainsKey(assetPath))
+            // Two-state guard:
+            //   1 = currently in-progress on this call stack (true cyclic recursion)
+            //   2 = completed successfully (memoize, no reparse)
+            // Failure rolls the entry back so a sibling caller from a different ancestor can retry.
+            if (Mappings.PathsAlreadyProcessedForSchemas.TryGetValue(assetPath, out byte existingState))
             {
-                return false;
+                if (existingState == 2) return true;
+                if (existingState == 1) return false;
             }
 
             bool success = false;
+            Mappings.PathsAlreadyProcessedForSchemas[assetPath] = 1;
             try
             {
-                Mappings.PathsAlreadyProcessedForSchemas[assetPath] = 1;
-
                 // initial read to just fetch the FolderName
                 UAsset otherAsset = new UAsset(this.ObjectVersion, this.ObjectVersionUE5, this.CustomVersionContainer.Select(item => (CustomVersion)item.Clone()).ToList(), this.Mappings);
                 AssetBinaryReader otherReader = otherAsset.PathToReader(pathOnDisk);
@@ -1355,14 +1383,44 @@ namespace UAssetAPI
                         OtherAssetsFailedToAccess.Add(entry);
                     }
                 }
+
+                success = true;
+                Mappings.PathsAlreadyProcessedForSchemas[assetPath] = 2;
             }
             catch
             {
-                // if we fail to parse the other asset, that's perfectly fine; just move on
+                // if we fail to parse the other asset, roll back the in-progress marker so a sibling
+                // caller from a different ancestor can retry once its missing deps are available.
+                Mappings.PathsAlreadyProcessedForSchemas.TryRemove(assetPath, out _);
                 success = false;
             }
 
             return success;
+        }
+
+        /// <summary>
+        /// Walks the full import map and attempts to pull schemas for every external package reference
+        /// (any import whose ObjectName starts with "/" and isn't a "/Script" package). Idempotent via
+        /// <see cref="Usmap.PathsAlreadyProcessedForSchemas"/>; safe to call multiple times.
+        /// </summary>
+        private void PreloadAllImportSchemas()
+        {
+            if (CustomSerializationFlags.HasFlag(CustomSerializationFlags.SkipPreloadDependencyLoading)) return;
+            if (Mappings?.Schemas == null) return;
+            if (Imports == null) return;
+
+            for (int i = 0; i < Imports.Count; i++)
+            {
+                Import imp = Imports[i];
+                FName name = imp?.ObjectName;
+                if (name?.Value?.Value == null) continue;
+                string objName = name.Value.Value;
+                if (string.IsNullOrEmpty(objName)) continue;
+                if (!objName.StartsWith("/")) continue;
+                if (objName.StartsWith("/Script")) continue;
+
+                PullSchemasFromAnotherAsset(name);
+            }
         }
 
         /// <summary>
@@ -2258,6 +2316,13 @@ namespace UAssetAPI
             {
                 bool skipLoadingExports = CustomSerializationFlags.HasFlag(CustomSerializationFlags.SkipLoadingExports);
                 bool skipParsingExports = skipLoadingExports || CustomSerializationFlags.HasFlag(CustomSerializationFlags.SkipParsingExports);
+
+                // Pull schemas for every external import before any export is parsed. LoadDependencies
+                // only walks SerializationBefore* dep arrays, which omit parent-class references — those
+                // typically appear only in SuperIndex / CreateBefore* arrays. Walking the full import map
+                // is brute-force but reliable: PullSchemasFromAnotherAsset is idempotent via the
+                // PathsAlreadyProcessedForSchemas guard.
+                PreloadAllImportSchemas();
 
                 // load dependencies, if needed and available
                 Dictionary<int, IList<int>> depsMap = LoadDependencies();
