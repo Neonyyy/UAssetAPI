@@ -1375,28 +1375,67 @@ namespace UAssetAPI
         }
 
         /// <summary>
-        /// Walks the full import map and attempts to pull schemas for every external package reference
-        /// (any import whose ObjectName starts with "/" and isn't a "/Script" package). Idempotent via
-        /// <see cref="Usmap.PathsAlreadyProcessedForSchemas"/>; safe to call multiple times.
+        /// Walks the Class/Super/Outer/Template chains of every export index in <paramref name="failedExports"/>,
+        /// recursing through local exports until it reaches external imports, and pulls schemas for any
+        /// path-shaped (non-"/Script") package import it finds. Used to recover parent-class schemas that
+        /// <see cref="LoadDependencies"/>' SerializationBefore* walk misses (e.g. a SuperIndex chain that
+        /// only appears in CreateBefore* arrays). Narrower than walking the full import map so
+        /// <see cref="OtherAssetsFailedToAccess"/> doesn't fill with irrelevant entries.
         /// </summary>
-        private void PreloadAllImportSchemas()
+        private void PullSchemasForFailedExportChains(IEnumerable<int> failedExports)
         {
             if (CustomSerializationFlags.HasFlag(CustomSerializationFlags.SkipPreloadDependencyLoading)) return;
             if (Mappings?.Schemas == null) return;
-            if (Imports == null) return;
+            if (Exports == null || Imports == null) return;
 
-            for (int i = 0; i < Imports.Count; i++)
+            var visitedExports = new HashSet<int>();
+            var visitedImports = new HashSet<int>();
+
+            foreach (int failedIdx in failedExports)
             {
-                Import imp = Imports[i];
-                FName name = imp?.ObjectName;
-                if (name?.Value?.Value == null) continue;
-                string objName = name.Value.Value;
-                if (string.IsNullOrEmpty(objName)) continue;
-                if (!objName.StartsWith("/")) continue;
-                if (objName.StartsWith("/Script")) continue;
+                if (failedIdx < 0 || failedIdx >= Exports.Count) continue;
+                Export exp = Exports[failedIdx];
+                if (exp == null) continue;
 
-                PullSchemasFromAnotherAsset(name);
+                WalkChainForSchemaPull(exp.ClassIndex, visitedExports, visitedImports);
+                WalkChainForSchemaPull(exp.SuperIndex, visitedExports, visitedImports);
+                WalkChainForSchemaPull(exp.OuterIndex, visitedExports, visitedImports);
+                WalkChainForSchemaPull(exp.TemplateIndex, visitedExports, visitedImports);
             }
+        }
+
+        private void WalkChainForSchemaPull(FPackageIndex idx, HashSet<int> visitedExports, HashSet<int> visitedImports)
+        {
+            if (idx == null || idx.Index == 0) return;
+
+            if (idx.IsExport())
+            {
+                int eIdx = idx.Index - 1;
+                if (eIdx < 0 || eIdx >= Exports.Count) return;
+                if (!visitedExports.Add(eIdx)) return;
+                Export e = Exports[eIdx];
+                if (e == null) return;
+
+                WalkChainForSchemaPull(e.ClassIndex, visitedExports, visitedImports);
+                WalkChainForSchemaPull(e.SuperIndex, visitedExports, visitedImports);
+                WalkChainForSchemaPull(e.OuterIndex, visitedExports, visitedImports);
+                WalkChainForSchemaPull(e.TemplateIndex, visitedExports, visitedImports);
+                return;
+            }
+
+            int iIdx = -idx.Index - 1;
+            if (iIdx < 0 || iIdx >= Imports.Count) return;
+            if (!visitedImports.Add(iIdx)) return;
+            Import imp = Imports[iIdx];
+            if (imp == null) return;
+
+            string objName = imp.ObjectName?.Value?.Value;
+            if (!string.IsNullOrEmpty(objName) && objName.StartsWith("/") && !objName.StartsWith("/Script"))
+            {
+                PullSchemasFromAnotherAsset(imp.ObjectName);
+            }
+
+            WalkChainForSchemaPull(imp.OuterIndex, visitedExports, visitedImports);
         }
 
         /// <summary>
@@ -2342,9 +2381,11 @@ namespace UAssetAPI
                     // Post-straggler preload-retry pass: if any export hit the catch in the first
                     // pass AND the straggler retry still left it as a RawExport, the missing schema
                     // may live in a parent-class import that LoadDependencies' SerializationBefore*
-                    // walk doesn't reach. Do a one-time full-import-map schema pull and re-attempt
-                    // those exports. Gated by the failure set so fixtures that parse cleanly never
-                    // pay any scope cost.
+                    // walk doesn't reach (e.g. SuperIndex chains only present in CreateBefore*
+                    // arrays). Walk just the Class/Super/Outer/Template chains of the failed
+                    // exports — narrow enough that OtherAssetsFailedToAccess only collects entries
+                    // for imports actually referenced by failed exports (UAssetGUI uses that list
+                    // to extract dependencies from containers, so a broad walk floods it).
                     if (_exportsFailedFirstParse != null
                         && !skipLoadingExports
                         && !skipParsingExports
@@ -2352,8 +2393,12 @@ namespace UAssetAPI
                         && !CustomSerializationFlags.HasFlag(CustomSerializationFlags.SkipPreloadDependencyLoading)
                         && !IsParsingToPullSchemas)
                     {
+                        // Snapshot first because ConvertExportToChildExportAndRead's catch path
+                        // Add()s into _exportsFailedFirstParse and the chain walker is keyed on it.
+                        int[] retryIndices = _exportsFailedFirstParse.ToArray();
+
                         bool anyStillRaw = false;
-                        foreach (int failedIdx in _exportsFailedFirstParse)
+                        foreach (int failedIdx in retryIndices)
                         {
                             if (failedIdx >= 0 && failedIdx < Exports.Count && Exports[failedIdx] is RawExport)
                             {
@@ -2364,12 +2409,8 @@ namespace UAssetAPI
 
                         if (anyStillRaw)
                         {
-                            PreloadAllImportSchemas();
+                            PullSchemasForFailedExportChains(retryIndices);
 
-                            // Snapshot to a local array because ConvertExportToChildExportAndRead's
-                            // catch path Add()s into _exportsFailedFirstParse, which could otherwise
-                            // invalidate the enumerator on retried-and-failed exports.
-                            int[] retryIndices = _exportsFailedFirstParse.ToArray();
                             foreach (int failedIdx in retryIndices)
                             {
                                 if (failedIdx < 0 || failedIdx >= Exports.Count) continue;
