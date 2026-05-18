@@ -1101,9 +1101,37 @@ namespace UAssetAPI
 #if DEBUGVERBOSE
                 Console.WriteLine("\nFailed to parse export " + (i + 1) + ": " + ex.ToString());
 #endif
+                long nextStarting;
+                if ((Exports.Count - 1) > i)
+                {
+                    nextStarting = Exports[i + 1].SerialOffset;
+                }
+                else
+                {
+                    var uas = (UAsset)reader.Asset;
+                    nextStarting = uas.BulkDataStartOffset;
+                }
+
                 if (read) reader.BaseStream.Seek(Exports[i].SerialOffset, SeekOrigin.Begin);
                 Exports[i] = Exports[i].ConvertToChildExport<RawExport>();
                 if (read) ((RawExport)Exports[i]).Data = reader.ReadBytes((int)Exports[i].SerialSize);
+
+                // Preserve the bytes that follow SerialSize, up to the next export's SerialOffset
+                // (or BulkDataStartOffset for the last export). The success path stores these as
+                // Extras; the round-trip output is otherwise shorter than the original. Do NOT set
+                // alreadySerialized here — the straggler loop at line ~2257 is the existing retry
+                // mechanism for exports that failed first pass, and gating it would leave any
+                // recoverable export demoted to RawExport.
+                if (read)
+                {
+                    long extrasLen = nextStarting - reader.BaseStream.Position;
+                    if (extrasLen > 0)
+                    {
+                        Exports[i].Extras = reader.ReadBytes((int)extrasLen);
+                    }
+                }
+
+                (_exportsFailedFirstParse ??= new HashSet<int>()).Add(i);
             }
 #pragma warning restore CS0168 // Variable is declared but never used
         }
@@ -1292,17 +1320,20 @@ namespace UAssetAPI
                 return false;
             }
 
-            // basic circular referencing guard
-            if (Mappings.PathsAlreadyProcessedForSchemas.ContainsKey(assetPath))
+            // Two-state guard:
+            //   1 = currently in-progress on this call stack (true cyclic recursion)
+            //   2 = completed successfully (memoize, no reparse)
+            // Failure rolls the entry back so a sibling caller from a different ancestor can retry.
+            if (Mappings.PathsAlreadyProcessedForSchemas.TryGetValue(assetPath, out byte existingState))
             {
-                return false;
+                if (existingState == 2) return true;
+                if (existingState == 1) return false;
             }
 
             bool success = false;
+            Mappings.PathsAlreadyProcessedForSchemas[assetPath] = 1;
             try
             {
-                Mappings.PathsAlreadyProcessedForSchemas[assetPath] = 1;
-
                 // initial read to just fetch the FolderName
                 UAsset otherAsset = new UAsset(this.ObjectVersion, this.ObjectVersionUE5, this.CustomVersionContainer.Select(item => (CustomVersion)item.Clone()).ToList(), this.Mappings);
                 AssetBinaryReader otherReader = otherAsset.PathToReader(pathOnDisk);
@@ -1328,14 +1359,44 @@ namespace UAssetAPI
                         OtherAssetsFailedToAccess.Add(entry);
                     }
                 }
+
+                success = true;
+                Mappings.PathsAlreadyProcessedForSchemas[assetPath] = 2;
             }
             catch
             {
-                // if we fail to parse the other asset, that's perfectly fine; just move on
+                // if we fail to parse the other asset, roll back the in-progress marker so a sibling
+                // caller from a different ancestor can retry once its missing deps are available.
+                Mappings.PathsAlreadyProcessedForSchemas.TryRemove(assetPath, out _);
                 success = false;
             }
 
             return success;
+        }
+
+        /// <summary>
+        /// Walks the full import map and attempts to pull schemas for every external package reference
+        /// (any import whose ObjectName starts with "/" and isn't a "/Script" package). Idempotent via
+        /// <see cref="Usmap.PathsAlreadyProcessedForSchemas"/>; safe to call multiple times.
+        /// </summary>
+        private void PreloadAllImportSchemas()
+        {
+            if (CustomSerializationFlags.HasFlag(CustomSerializationFlags.SkipPreloadDependencyLoading)) return;
+            if (Mappings?.Schemas == null) return;
+            if (Imports == null) return;
+
+            for (int i = 0; i < Imports.Count; i++)
+            {
+                Import imp = Imports[i];
+                FName name = imp?.ObjectName;
+                if (name?.Value?.Value == null) continue;
+                string objName = name.Value.Value;
+                if (string.IsNullOrEmpty(objName)) continue;
+                if (!objName.StartsWith("/")) continue;
+                if (objName.StartsWith("/Script")) continue;
+
+                PullSchemasFromAnotherAsset(name);
+            }
         }
 
         /// <summary>
@@ -1633,6 +1694,14 @@ namespace UAssetAPI
 
         [JsonIgnore]
         internal bool haveWeLoadedDependencies = false;
+
+        // Tracks export indices that hit the catch in ConvertExportToChildExportAndRead during
+        // the dependency-sorted first pass. Used by the post-straggler preload-retry pass in Read()
+        // to attempt re-parsing exports whose schemas might be in import-map references that
+        // LoadDependencies' SerializationBefore* walk doesn't reach (e.g. parent-class references).
+        [JsonIgnore]
+        private HashSet<int> _exportsFailedFirstParse;
+
         private Dictionary<int, IList<int>> LoadDependencies()
         {
             haveWeLoadedDependencies = true;
@@ -2268,6 +2337,48 @@ namespace UAssetAPI
                         }
 
                         ConvertExportToChildExportAndRead(reader, i);
+                    }
+
+                    // Post-straggler preload-retry pass: if any export hit the catch in the first
+                    // pass AND the straggler retry still left it as a RawExport, the missing schema
+                    // may live in a parent-class import that LoadDependencies' SerializationBefore*
+                    // walk doesn't reach. Do a one-time full-import-map schema pull and re-attempt
+                    // those exports. Gated by the failure set so fixtures that parse cleanly never
+                    // pay any scope cost.
+                    if (_exportsFailedFirstParse != null
+                        && !skipLoadingExports
+                        && !skipParsingExports
+                        && Mappings?.Schemas != null
+                        && !CustomSerializationFlags.HasFlag(CustomSerializationFlags.SkipPreloadDependencyLoading)
+                        && !IsParsingToPullSchemas)
+                    {
+                        bool anyStillRaw = false;
+                        foreach (int failedIdx in _exportsFailedFirstParse)
+                        {
+                            if (failedIdx >= 0 && failedIdx < Exports.Count && Exports[failedIdx] is RawExport)
+                            {
+                                anyStillRaw = true;
+                                break;
+                            }
+                        }
+
+                        if (anyStillRaw)
+                        {
+                            PreloadAllImportSchemas();
+
+                            // Snapshot to a local array because ConvertExportToChildExportAndRead's
+                            // catch path Add()s into _exportsFailedFirstParse, which could otherwise
+                            // invalidate the enumerator on retried-and-failed exports.
+                            int[] retryIndices = _exportsFailedFirstParse.ToArray();
+                            foreach (int failedIdx in retryIndices)
+                            {
+                                if (failedIdx < 0 || failedIdx >= Exports.Count) continue;
+                                if (Exports[failedIdx] is not RawExport) continue;
+
+                                reader.BaseStream.Seek(Exports[failedIdx].SerialOffset, SeekOrigin.Begin);
+                                ConvertExportToChildExportAndRead(reader, failedIdx);
+                            }
+                        }
                     }
                 }
             }
