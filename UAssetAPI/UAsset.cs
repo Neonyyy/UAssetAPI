@@ -671,37 +671,64 @@ namespace UAssetAPI
         }
 
         /// <summary>
-        /// Attempt to find another asset on disk given an asset path (i.e. one starting with /Game/).
+        /// Attempt to find another asset on disk given an asset path (starting with /Game/ or within a plugin).
         /// </summary>
         /// <param name="path">The asset path.</param>
         /// <returns>The path to the file on disk, or null if none could be found.</returns>
         public virtual string FindAssetOnDiskFromPath(string path)
         {
             if (!path.StartsWith("/") || path.StartsWith("/Script")) return null;
-            path = path.Substring(6) + ".uasset";
+            int firstIdxWithoutSlash = path.IndexOf('/') + 1;
+            int secondIdxWithoutSlash = path.IndexOf('/', firstIdxWithoutSlash) + 1;
+            string pathPrefixPart = path.Substring(firstIdxWithoutSlash, secondIdxWithoutSlash - firstIdxWithoutSlash - 1);
+            string pathNoPrefix = path.Substring(secondIdxWithoutSlash) + ".uasset";
 
             string mappedPathOnDisk = string.Empty;
             bool foundMappedPath = false;
 
+            string desiredPathRelativeToContent = null;
+            switch (pathPrefixPart)
+            {
+                case "Game":
+                    desiredPathRelativeToContent = pathNoPrefix.FixDirectorySeparatorsForDisk();
+                    break;
+                default:
+                    // presumably a plugin
+                    desiredPathRelativeToContent = ".." + Path.DirectorySeparatorChar + "Plugins" + Path.DirectorySeparatorChar + pathPrefixPart + Path.DirectorySeparatorChar + "Content" + Path.DirectorySeparatorChar + pathNoPrefix.FixDirectorySeparatorsForDisk();
+                    break;
+            }
+
             var contentPart = Path.DirectorySeparatorChar + "Content";
+            var pluginsPart = Path.DirectorySeparatorChar + "Plugins";
             if (!string.IsNullOrEmpty(FilePath))
             {
                 var fixedFilePath = FilePath.FixDirectorySeparatorsForDisk();
                 var contentIndex = fixedFilePath.LastIndexOf(contentPart);
+                var pluginsIndex = fixedFilePath.LastIndexOf(pluginsPart);
 
                 // let's see if the current path has Content in it, then we can re-orient ourselves
+                string contentDir = null;
                 if (!foundMappedPath && contentIndex > 0)
                 {
-                    var contentDir = fixedFilePath.Substring(0, contentIndex + contentPart.Length);
-                    mappedPathOnDisk = Path.Combine(contentDir, path.FixDirectorySeparatorsForDisk());
-                    foundMappedPath = File.Exists(mappedPathOnDisk); // not worrying too much about race condition, we'll put a try catch later
+                    contentDir = fixedFilePath.Substring(0, contentIndex + contentPart.Length);
+                }
+
+                // let's see if the current path has Plugins in it, then we can re-orient ourselves
+                if (!foundMappedPath && pluginsIndex > 0)
+                {
+                    contentDir = fixedFilePath.Substring(0, pluginsIndex + pluginsPart.Length) + Path.DirectorySeparatorChar + ".." + Path.DirectorySeparatorChar + "Content";
+                }
+
+                if (contentDir != null)
+                {
+                    mappedPathOnDisk = Path.Combine(contentDir, desiredPathRelativeToContent);
+                    foundMappedPath = File.Exists(mappedPathOnDisk); // not worrying too much about race condition, we put a try catch later in the code
                 }
 
                 if (!foundMappedPath)
                 {
                     // let's see if it exists in the same directory
-                    var rawFileName = Path.GetFileName(path);
-                    mappedPathOnDisk = Path.Combine(Directory.GetParent(FilePath).FullName, Path.GetFileName(path));
+                    mappedPathOnDisk = Path.Combine(Directory.GetParent(FilePath).FullName, Path.GetFileName(pathNoPrefix));
                     foundMappedPath = File.Exists(mappedPathOnDisk);
                 }
             }
@@ -1116,10 +1143,12 @@ namespace UAssetAPI
                 Exports[i] = Exports[i].ConvertToChildExport<RawExport>();
                 if (read) ((RawExport)Exports[i]).Data = reader.ReadBytes((int)Exports[i].SerialSize);
 
-                // Preserve the bytes that follow this export's SerialSize block, up to the next
-                // export's SerialOffset (or BulkDataStartOffset for the last export). The success
-                // path stores these as Extras; the round-trip output is otherwise shorter than
-                // the original and misaligns content the engine reads beyond SerialSize.
+                // Preserve the bytes that follow SerialSize, up to the next export's SerialOffset
+                // (or BulkDataStartOffset for the last export). The success path stores these as
+                // Extras; the round-trip output is otherwise shorter than the original. Do NOT set
+                // alreadySerialized here — the straggler loop at line ~2257 is the existing retry
+                // mechanism for exports that failed first pass, and gating it would leave any
+                // recoverable export demoted to RawExport.
                 if (read)
                 {
                     long extrasLen = nextStarting - reader.BaseStream.Position;
@@ -1127,8 +1156,9 @@ namespace UAssetAPI
                     {
                         Exports[i].Extras = reader.ReadBytes((int)extrasLen);
                     }
-                    Exports[i].alreadySerialized = true;
                 }
+
+                (_exportsFailedFirstParse ??= new HashSet<int>()).Add(i);
             }
 #pragma warning restore CS0168 // Variable is declared but never used
         }
@@ -1372,28 +1402,67 @@ namespace UAssetAPI
         }
 
         /// <summary>
-        /// Walks the full import map and attempts to pull schemas for every external package reference
-        /// (any import whose ObjectName starts with "/" and isn't a "/Script" package). Idempotent via
-        /// <see cref="Usmap.PathsAlreadyProcessedForSchemas"/>; safe to call multiple times.
+        /// Walks the Class/Super/Outer/Template chains of every export index in <paramref name="failedExports"/>,
+        /// recursing through local exports until it reaches external imports, and pulls schemas for any
+        /// path-shaped (non-"/Script") package import it finds. Used to recover parent-class schemas that
+        /// <see cref="LoadDependencies"/>' SerializationBefore* walk misses (e.g. a SuperIndex chain that
+        /// only appears in CreateBefore* arrays). Narrower than walking the full import map so
+        /// <see cref="OtherAssetsFailedToAccess"/> doesn't fill with irrelevant entries.
         /// </summary>
-        private void PreloadAllImportSchemas()
+        private void PullSchemasForFailedExportChains(IEnumerable<int> failedExports)
         {
             if (CustomSerializationFlags.HasFlag(CustomSerializationFlags.SkipPreloadDependencyLoading)) return;
             if (Mappings?.Schemas == null) return;
-            if (Imports == null) return;
+            if (Exports == null || Imports == null) return;
 
-            for (int i = 0; i < Imports.Count; i++)
+            var visitedExports = new HashSet<int>();
+            var visitedImports = new HashSet<int>();
+
+            foreach (int failedIdx in failedExports)
             {
-                Import imp = Imports[i];
-                FName name = imp?.ObjectName;
-                if (name?.Value?.Value == null) continue;
-                string objName = name.Value.Value;
-                if (string.IsNullOrEmpty(objName)) continue;
-                if (!objName.StartsWith("/")) continue;
-                if (objName.StartsWith("/Script")) continue;
+                if (failedIdx < 0 || failedIdx >= Exports.Count) continue;
+                Export exp = Exports[failedIdx];
+                if (exp == null) continue;
 
-                PullSchemasFromAnotherAsset(name);
+                WalkChainForSchemaPull(exp.ClassIndex, visitedExports, visitedImports);
+                WalkChainForSchemaPull(exp.SuperIndex, visitedExports, visitedImports);
+                WalkChainForSchemaPull(exp.OuterIndex, visitedExports, visitedImports);
+                WalkChainForSchemaPull(exp.TemplateIndex, visitedExports, visitedImports);
             }
+        }
+
+        private void WalkChainForSchemaPull(FPackageIndex idx, HashSet<int> visitedExports, HashSet<int> visitedImports)
+        {
+            if (idx == null || idx.Index == 0) return;
+
+            if (idx.IsExport())
+            {
+                int eIdx = idx.Index - 1;
+                if (eIdx < 0 || eIdx >= Exports.Count) return;
+                if (!visitedExports.Add(eIdx)) return;
+                Export e = Exports[eIdx];
+                if (e == null) return;
+
+                WalkChainForSchemaPull(e.ClassIndex, visitedExports, visitedImports);
+                WalkChainForSchemaPull(e.SuperIndex, visitedExports, visitedImports);
+                WalkChainForSchemaPull(e.OuterIndex, visitedExports, visitedImports);
+                WalkChainForSchemaPull(e.TemplateIndex, visitedExports, visitedImports);
+                return;
+            }
+
+            int iIdx = -idx.Index - 1;
+            if (iIdx < 0 || iIdx >= Imports.Count) return;
+            if (!visitedImports.Add(iIdx)) return;
+            Import imp = Imports[iIdx];
+            if (imp == null) return;
+
+            string objName = imp.ObjectName?.Value?.Value;
+            if (!string.IsNullOrEmpty(objName) && objName.StartsWith("/") && !objName.StartsWith("/Script"))
+            {
+                PullSchemasFromAnotherAsset(imp.ObjectName);
+            }
+
+            WalkChainForSchemaPull(imp.OuterIndex, visitedExports, visitedImports);
         }
 
         /// <summary>
@@ -1691,6 +1760,14 @@ namespace UAssetAPI
 
         [JsonIgnore]
         internal bool haveWeLoadedDependencies = false;
+
+        // Tracks export indices that hit the catch in ConvertExportToChildExportAndRead during
+        // the dependency-sorted first pass. Used by the post-straggler preload-retry pass in Read()
+        // to attempt re-parsing exports whose schemas might be in import-map references that
+        // LoadDependencies' SerializationBefore* walk doesn't reach (e.g. parent-class references).
+        [JsonIgnore]
+        private HashSet<int> _exportsFailedFirstParse;
+
         private Dictionary<int, IList<int>> LoadDependencies()
         {
             haveWeLoadedDependencies = true;
@@ -2290,13 +2367,6 @@ namespace UAssetAPI
                 bool skipLoadingExports = CustomSerializationFlags.HasFlag(CustomSerializationFlags.SkipLoadingExports);
                 bool skipParsingExports = skipLoadingExports || CustomSerializationFlags.HasFlag(CustomSerializationFlags.SkipParsingExports);
 
-                // Pull schemas for every external import before any export is parsed. LoadDependencies
-                // only walks SerializationBefore* dep arrays, which omit parent-class references — those
-                // typically appear only in SuperIndex / CreateBefore* arrays. Walking the full import map
-                // is brute-force but reliable: PullSchemasFromAnotherAsset is idempotent via the
-                // PathsAlreadyProcessedForSchemas guard.
-                PreloadAllImportSchemas();
-
                 // load dependencies, if needed and available
                 Dictionary<int, IList<int>> depsMap = LoadDependencies();
                 exportLoadOrder.AddRange(Enumerable.Range(1, Exports.Count).SortByDependencies(depsMap));
@@ -2333,6 +2403,50 @@ namespace UAssetAPI
                         }
 
                         ConvertExportToChildExportAndRead(reader, i);
+                    }
+
+                    // Post-straggler preload-retry pass: if any export hit the catch in the first
+                    // pass AND the straggler retry still left it as a RawExport, the missing schema
+                    // may live in a parent-class import that LoadDependencies' SerializationBefore*
+                    // walk doesn't reach (e.g. SuperIndex chains only present in CreateBefore*
+                    // arrays). Walk just the Class/Super/Outer/Template chains of the failed
+                    // exports — narrow enough that OtherAssetsFailedToAccess only collects entries
+                    // for imports actually referenced by failed exports (UAssetGUI uses that list
+                    // to extract dependencies from containers, so a broad walk floods it).
+                    if (_exportsFailedFirstParse != null
+                        && !skipLoadingExports
+                        && !skipParsingExports
+                        && Mappings?.Schemas != null
+                        && !CustomSerializationFlags.HasFlag(CustomSerializationFlags.SkipPreloadDependencyLoading)
+                        && !IsParsingToPullSchemas)
+                    {
+                        // Snapshot first because ConvertExportToChildExportAndRead's catch path
+                        // Add()s into _exportsFailedFirstParse and the chain walker is keyed on it.
+                        int[] retryIndices = _exportsFailedFirstParse.ToArray();
+
+                        bool anyStillRaw = false;
+                        foreach (int failedIdx in retryIndices)
+                        {
+                            if (failedIdx >= 0 && failedIdx < Exports.Count && Exports[failedIdx] is RawExport)
+                            {
+                                anyStillRaw = true;
+                                break;
+                            }
+                        }
+
+                        if (anyStillRaw)
+                        {
+                            PullSchemasForFailedExportChains(retryIndices);
+
+                            foreach (int failedIdx in retryIndices)
+                            {
+                                if (failedIdx < 0 || failedIdx >= Exports.Count) continue;
+                                if (Exports[failedIdx] is not RawExport) continue;
+
+                                reader.BaseStream.Seek(Exports[failedIdx].SerialOffset, SeekOrigin.Begin);
+                                ConvertExportToChildExportAndRead(reader, failedIdx);
+                            }
+                        }
                     }
                 }
             }
