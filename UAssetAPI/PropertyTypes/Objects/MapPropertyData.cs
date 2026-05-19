@@ -115,6 +115,15 @@ public class MapPropertyData : PropertyData
                     // 8-byte read throws (BP_MJJJ_AI_New's CDO has its enum-in-map within a
                     // few bytes of the property's end). A failed peek means the data can't
                     // be FName format anyway, so fall through to the integer-read path.
+                    //
+                    // Beyond the basic FName shape check, require the referenced name to
+                    // actually match one of this enum's known value names. Random integer-format
+                    // bytes can pass the basic shape check (the underlying-integer byte plus
+                    // some bytes from the following property happen to make a valid name-map
+                    // index with a zero index), which would silently consume 8 bytes instead
+                    // of 1 and drift downstream reads off the end of the export. Matching the
+                    // peeked name against the enum's value list eliminates that false positive
+                    // for any enum whose values are known in the mappings.
                     try
                     {
                         int peekedNamePointer = reader.ReadInt32();
@@ -124,7 +133,13 @@ public class MapPropertyData : PropertyData
                         if (peekedNamePointer >= 0 && peekedNamePointer < nameMapList.Count && peekedNameIndex == 0)
                         {
                             string nameRef = reader.Asset.GetNameReference(peekedNamePointer)?.ToString() ?? string.Empty;
-                            looksLikeFName = !nameRef.Contains("/");
+                            if (!string.IsNullOrEmpty(nameRef) && !nameRef.Contains("/")
+                                && reader.Asset.Mappings.EnumMap.TryGetValue(enumDat.Name, out UsmapEnum peekedEnum)
+                                && peekedEnum.Values != null
+                                && peekedEnum.Values.Values.Contains(nameRef))
+                            {
+                                looksLikeFName = true;
+                            }
                         }
                     }
                     catch

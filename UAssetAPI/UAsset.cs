@@ -1128,20 +1128,24 @@ namespace UAssetAPI
 #if DEBUGVERBOSE
                 Console.WriteLine("\nFailed to parse export " + (i + 1) + ": " + ex.ToString());
 #endif
-                // Diagnostic: write the exception to <asset_path>.parse-errors.log when this
-                // is the user-visible top-level Read (not a nested schema-pull). Lets users
-                // surface parse failures without rebuilding with DEBUGVERBOSE. Wrapped in a
-                // try so a logging failure never breaks the parse-recovery path below.
-                if (read && !IsParsingToPullSchemas && !string.IsNullOrEmpty(FilePath))
+                // Diagnostic: write the exception to <asset_path>.parse-errors.log. We log
+                // BOTH top-level reads AND nested schema-pull reads (IsParsingToPullSchemas
+                // is true for the latter) — a schema-pull silently dropping exceptions makes
+                // it impossible to tell when the user's actual asset is failing because a
+                // *dependency* couldn't parse. Each pulled asset gets its own log next to it,
+                // and the dependent asset's log will only fire if it has its own failure.
+                if (read && !string.IsNullOrEmpty(FilePath))
                 {
                     try
                     {
                         string logPath = FilePath + ".parse-errors.log";
                         string objName = Exports[i]?.ObjectName?.ToString() ?? "?";
-                        File.AppendAllText(logPath, "[" + DateTime.Now.ToString("O") + "] Export " + (i + 1) + " (" + objName + "): " + ex.ToString() + "\n\n");
+                        string contextTag = IsParsingToPullSchemas ? " [during schema pull]" : string.Empty;
+                        File.AppendAllText(logPath, "[" + DateTime.Now.ToString("O") + "]" + contextTag + " Export " + (i + 1) + " (" + objName + "): " + ex.ToString() + "\n\n");
                     }
                     catch { /* swallow */ }
                 }
+
                 long nextStarting;
                 if ((Exports.Count - 1) > i)
                 {
