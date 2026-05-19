@@ -96,6 +96,28 @@ public class MapPropertyData : PropertyData
                 data.PropertyTypeName = propertyTypeNameLocal;
                 data.Read(reader, false, 1, 0, PropertySerializationContext.Map);
                 return data;
+            case "EnumProperty":
+                // The schema lookup inside EnumPropertyData.Read keys on the property's own
+                // Name/Ancestry, which for a map key/value resolves to the *map's* UsmapMapData
+                // — not a UsmapEnumData. As a result, EnumType/InnerType would never be set,
+                // the unversioned integer-index branch can't fire, and the read goes off the
+                // end of the property. Pull the right UsmapEnumData (key or value) from the
+                // map's schema here and pre-set them on the EnumPropertyData before Read.
+                EnumPropertyData enumData = new EnumPropertyData(name);
+                enumData.Ancestry.Initialize(Ancestry, Name);
+                enumData.Offset = reader.BaseStream.Position;
+                enumData.PropertyTypeName = PropertyTypeName?.GetParameter(isKey ? 0 : 1);
+                if (reader.Asset.Mappings != null && reader.Asset.Mappings.TryGetPropertyData(Name, Ancestry, reader.Asset, out UsmapMapData mapDatForEnum))
+                {
+                    UsmapPropertyData sideData = isKey ? mapDatForEnum.InnerType : mapDatForEnum.ValueType;
+                    if (sideData is UsmapEnumData enumDat)
+                    {
+                        enumData.EnumType = FName.DefineDummy(reader.Asset, enumDat.Name);
+                        enumData.InnerType = FName.DefineDummy(reader.Asset, enumDat.InnerType.Type.ToString());
+                    }
+                }
+                enumData.Read(reader, false, 0, 0, PropertySerializationContext.Map);
+                return enumData;
             default:
                 var res = MainSerializer.TypeToClass(type, name, Ancestry, Name, null, reader.Asset, null, leng, propertyTypeName: PropertyTypeName?.GetParameter(0));
                 res.Ancestry.Initialize(Ancestry, Name);
