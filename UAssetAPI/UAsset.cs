@@ -1128,6 +1128,20 @@ namespace UAssetAPI
 #if DEBUGVERBOSE
                 Console.WriteLine("\nFailed to parse export " + (i + 1) + ": " + ex.ToString());
 #endif
+                // Diagnostic: write the exception to <asset_path>.parse-errors.log when this
+                // is the user-visible top-level Read (not a nested schema-pull). Lets users
+                // surface parse failures without rebuilding with DEBUGVERBOSE. Wrapped in a
+                // try so a logging failure never breaks the parse-recovery path below.
+                if (read && !IsParsingToPullSchemas && !string.IsNullOrEmpty(FilePath))
+                {
+                    try
+                    {
+                        string logPath = FilePath + ".parse-errors.log";
+                        string objName = Exports[i]?.ObjectName?.ToString() ?? "?";
+                        File.AppendAllText(logPath, "[" + DateTime.Now.ToString("O") + "] Export " + (i + 1) + " (" + objName + "): " + ex.ToString() + "\n\n");
+                    }
+                    catch { /* swallow */ }
+                }
                 long nextStarting;
                 if ((Exports.Count - 1) > i)
                 {
