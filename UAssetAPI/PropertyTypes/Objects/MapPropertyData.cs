@@ -109,16 +109,31 @@ public class MapPropertyData : PropertyData
                     && ((isKey ? mapDatForEnum.InnerType : mapDatForEnum.ValueType) is UsmapEnumData enumDat))
                 {
                     long savedPos = reader.BaseStream.Position;
-                    int peekedNamePointer = reader.ReadInt32();
-                    int peekedNameIndex = reader.ReadInt32();
-                    reader.BaseStream.Position = savedPos;
-
                     bool looksLikeFName = false;
-                    var nameMapList = reader.Asset.GetNameMapIndexList();
-                    if (peekedNamePointer >= 0 && peekedNamePointer < nameMapList.Count && peekedNameIndex == 0)
+
+                    // Guard the FName-shape peek: if we're near the end of the stream the
+                    // 8-byte read throws (BP_MJJJ_AI_New's CDO has its enum-in-map within a
+                    // few bytes of the property's end). A failed peek means the data can't
+                    // be FName format anyway, so fall through to the integer-read path.
+                    try
                     {
-                        string nameRef = reader.Asset.GetNameReference(peekedNamePointer)?.ToString() ?? string.Empty;
-                        looksLikeFName = !nameRef.Contains("/");
+                        int peekedNamePointer = reader.ReadInt32();
+                        int peekedNameIndex = reader.ReadInt32();
+
+                        var nameMapList = reader.Asset.GetNameMapIndexList();
+                        if (peekedNamePointer >= 0 && peekedNamePointer < nameMapList.Count && peekedNameIndex == 0)
+                        {
+                            string nameRef = reader.Asset.GetNameReference(peekedNamePointer)?.ToString() ?? string.Empty;
+                            looksLikeFName = !nameRef.Contains("/");
+                        }
+                    }
+                    catch
+                    {
+                        // peek ran off the end; not FName format
+                    }
+                    finally
+                    {
+                        reader.BaseStream.Position = savedPos;
                     }
 
                     if (!looksLikeFName)
