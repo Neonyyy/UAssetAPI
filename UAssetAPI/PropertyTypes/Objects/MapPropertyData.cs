@@ -97,27 +97,58 @@ public class MapPropertyData : PropertyData
                 data.Read(reader, false, 1, 0, PropertySerializationContext.Map);
                 return data;
             case "EnumProperty":
-                // The schema lookup inside EnumPropertyData.Read keys on the property's own
-                // Name/Ancestry, which for a map key/value resolves to the *map's* UsmapMapData
-                // — not a UsmapEnumData. As a result, EnumType/InnerType would never be set,
-                // the unversioned integer-index branch can't fire, and the read goes off the
-                // end of the property. Pull the right UsmapEnumData (key or value) from the
-                // map's schema here and pre-set them on the EnumPropertyData before Read.
-                EnumPropertyData enumData = new EnumPropertyData(name);
-                enumData.Ancestry.Initialize(Ancestry, Name);
-                enumData.Offset = reader.BaseStream.Position;
-                enumData.PropertyTypeName = PropertyTypeName?.GetParameter(isKey ? 0 : 1);
-                if (reader.Asset.Mappings != null && reader.Asset.Mappings.TryGetPropertyData(Name, Ancestry, reader.Asset, out UsmapMapData mapDatForEnum))
+                // Unversioned enum-in-map needs the underlying-integer wire format, but
+                // EnumPropertyData.Read gates that branch on serializationContext.IsNormal()
+                // (false in Map context) and its schema lookup keys on the map's own
+                // Name/Ancestry, which resolves to UsmapMapData rather than UsmapEnumData —
+                // so EnumType/InnerType are never populated and the read falls through to a
+                // versioned FName read that goes off the end of the property.
+                //
+                // Pull the per-side UsmapEnumData from the map's schema here and do the
+                // integer read inline. Keeps EnumPropertyData.Read untouched (avoids
+                // regressing Array / StructFallback paths that were relying on the existing
+                // gate).
+                if (reader.Asset.HasUnversionedProperties && reader.Asset.Mappings != null
+                    && reader.Asset.Mappings.TryGetPropertyData(Name, Ancestry, reader.Asset, out UsmapMapData mapDatForEnum)
+                    && ((isKey ? mapDatForEnum.InnerType : mapDatForEnum.ValueType) is UsmapEnumData enumDat))
                 {
-                    UsmapPropertyData sideData = isKey ? mapDatForEnum.InnerType : mapDatForEnum.ValueType;
-                    if (sideData is UsmapEnumData enumDat)
+                    string innerTypeName = enumDat.InnerType.Type.ToString();
+                    long? enumIndex = innerTypeName switch
                     {
+                        "ByteProperty" => reader.ReadByte(),
+                        "UInt16Property" => reader.ReadUInt16(),
+                        "UInt32Property" => reader.ReadUInt32(),
+                        "Int8Property" => reader.ReadSByte(),
+                        "Int16Property" => reader.ReadInt16(),
+                        "IntProperty" => reader.ReadInt32(),
+                        "Int64Property" => reader.ReadInt64(),
+                        _ => null
+                    };
+
+                    if (enumIndex.HasValue)
+                    {
+                        EnumPropertyData enumData = new EnumPropertyData(name);
+                        enumData.Ancestry.Initialize(Ancestry, Name);
+                        enumData.Offset = reader.BaseStream.Position;
+                        enumData.PropertyTypeName = PropertyTypeName?.GetParameter(isKey ? 0 : 1);
                         enumData.EnumType = FName.DefineDummy(reader.Asset, enumDat.Name);
-                        enumData.InnerType = FName.DefineDummy(reader.Asset, enumDat.InnerType.Type.ToString());
+                        enumData.InnerType = FName.DefineDummy(reader.Asset, innerTypeName);
+
+                        if (reader.Asset.Mappings.EnumMap.TryGetValue(enumData.EnumType.Value.Value, out UsmapEnum enumMapping)
+                            && enumMapping.Values != null
+                            && enumMapping.Values.TryGetValue(enumIndex.Value, out string enumValueName))
+                        {
+                            enumData.Value = FName.DefineDummy(reader.Asset, enumValueName);
+                        }
+                        else
+                        {
+                            enumData.Value = FName.DefineDummy(reader.Asset, EnumPropertyData.InvalidEnumIndexFallbackPrefix + enumIndex.Value.ToString());
+                        }
+
+                        return enumData;
                     }
                 }
-                enumData.Read(reader, false, 0, 0, PropertySerializationContext.Map);
-                return enumData;
+                goto default;
             default:
                 var res = MainSerializer.TypeToClass(type, name, Ancestry, Name, null, reader.Asset, null, leng, propertyTypeName: PropertyTypeName?.GetParameter(0));
                 res.Ancestry.Initialize(Ancestry, Name);
@@ -209,10 +240,58 @@ public class MapPropertyData : PropertyData
         {
             if (serializationContext == PropertySerializationContext.CanBeZero && ((CanBeZeroStream)writer.BaseStream).HasWrittenNonZero) break;
             entry.Key.Offset = writer.BaseStream.Position;
-            entry.Key.Write(writer, false, PropertySerializationContext.Map);
+            WriteMapElement(writer, entry.Key);
             entry.Value.Offset = writer.BaseStream.Position;
-            entry.Value.Write(writer, false, PropertySerializationContext.Map);
+            WriteMapElement(writer, entry.Value);
         }
+    }
+
+    // Mirror of the inline enum-in-map read in MapTypeToClass: an unversioned EnumProperty
+    // inside a TMap key/value uses the underlying-integer wire format. EnumPropertyData.Write
+    // gates its integer path on serializationContext.IsNormal(), so we'd otherwise fall back
+    // to a versioned-style FName write and the round-tripped file would be byte-different
+    // from disk.
+    private static void WriteMapElement(AssetBinaryWriter writer, PropertyData element)
+    {
+        if (writer.Asset.HasUnversionedProperties
+            && element is EnumPropertyData enumData
+            && enumData.EnumType?.Value?.Value != null
+            && enumData.InnerType?.Value?.Value != null)
+        {
+            long enumIndex = 0;
+            if (enumData.Value != null && writer.Asset.Mappings != null
+                && writer.Asset.Mappings.EnumMap.TryGetValue(enumData.EnumType.Value.Value, out UsmapEnum enumMapping)
+                && enumMapping.Values != null)
+            {
+                bool found = false;
+                foreach (var kv in enumMapping.Values)
+                {
+                    if (kv.Value == enumData.Value.Value.Value)
+                    {
+                        enumIndex = kv.Key;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found && enumData.Value.Value.Value.StartsWith(EnumPropertyData.InvalidEnumIndexFallbackPrefix))
+                {
+                    long.TryParse(enumData.Value.Value.Value.Substring(EnumPropertyData.InvalidEnumIndexFallbackPrefix.Length), out enumIndex);
+                }
+            }
+
+            switch (enumData.InnerType.Value.Value)
+            {
+                case "ByteProperty": writer.Write((byte)enumIndex); return;
+                case "UInt16Property": writer.Write((ushort)enumIndex); return;
+                case "UInt32Property": writer.Write((uint)enumIndex); return;
+                case "Int8Property": writer.Write((sbyte)enumIndex); return;
+                case "Int16Property": writer.Write((short)enumIndex); return;
+                case "IntProperty": writer.Write((int)enumIndex); return;
+                case "Int64Property": writer.Write((long)enumIndex); return;
+            }
+        }
+
+        element.Write(writer, false, PropertySerializationContext.Map);
     }
 
     public override int Write(AssetBinaryWriter writer, bool includeHeader, PropertySerializationContext serializationContext = PropertySerializationContext.Normal)

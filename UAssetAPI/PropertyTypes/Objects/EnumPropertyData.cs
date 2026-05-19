@@ -39,12 +39,7 @@ public class EnumPropertyData : PropertyData<FName>
             InnerType = reader.Asset.HasUnversionedProperties ? FName.DefineDummy(reader.Asset, enumDat1.InnerType.Type.ToString()) : new FName(reader.Asset, enumDat1.Name);
         }
 
-        // Unversioned enums serialize as their underlying integer regardless of container
-        // context — Normal, Map key/value, and Array element all use the same wire format.
-        // The IsNormal() gate previously here broke TMap<Enum, X> / TMap<X, Enum> parsing
-        // (EnumPropertyData.Read fell through to the versioned FName path and read off the
-        // end of the property).
-        if (reader.Asset.HasUnversionedProperties)
+        if (reader.Asset.HasUnversionedProperties && serializationContext.IsNormal())
         {
             Value = null;
             if (InnerType?.Value.Value == "ByteProperty" || InnerType?.Value.Value == "UInt16Property" || InnerType?.Value.Value == "UInt32Property")
@@ -140,9 +135,7 @@ public class EnumPropertyData : PropertyData<FName>
             InnerType = writer.Asset.HasUnversionedProperties ? FName.DefineDummy(writer.Asset, enumDat1.InnerType.Type.ToString()) : new FName(writer.Asset, enumDat1.Name);
         }
 
-        // Match the Read symmetry: unversioned enums emit the underlying integer in any
-        // serialization context (Normal, Map, Array).
-        if (writer.Asset.HasUnversionedProperties)
+        if (writer.Asset.HasUnversionedProperties && serializationContext.IsNormal())
         {
             if (ValidEnumInnerTypeList.Contains(InnerType?.Value?.Value))
             {
