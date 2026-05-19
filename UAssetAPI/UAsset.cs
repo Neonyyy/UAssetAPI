@@ -111,6 +111,18 @@ namespace UAssetAPI
         /// Skip loading exports at read time altogether. Entries in the export map will be read as raw exports of zero length, so they cannot be manually parsed later. If this flag is set, SkipParsingExports will also effectively be automatically set regardless of whether or not it was already set manually.
         /// </summary>
         SkipLoadingExports = 16,
+
+        /// <summary>
+        /// For unversioned packages: when reading/writing a TMap whose key or value is an
+        /// EnumProperty, use the enum's underlying integer wire format (1-8 bytes per
+        /// UsmapEnumData.InnerType) instead of the default FName-shaped wire format
+        /// (8 bytes). Some games (e.g. certain UE5.4 titles) emit the integer format and
+        /// the FName fallback otherwise consumes the wrong byte count, drifting the
+        /// stream and surfacing as a downstream parse failure. Off by default to
+        /// preserve compatibility with the larger set of existing assets that use the
+        /// FName-shaped format.
+        /// </summary>
+        UnversionedEnumInMapUseIntegerWireFormat = 32,
     }
 
 

@@ -97,97 +97,57 @@ public class MapPropertyData : PropertyData
                 data.Read(reader, false, 1, 0, PropertySerializationContext.Map);
                 return data;
             case "EnumProperty":
-                // Unversioned enum-in-map has an ambiguous wire format: some assets store the
-                // enum value as an FName (8 bytes, matches what EnumPropertyData.Read falls back
-                // to in Map context due to its IsNormal() gate), others store it as the underlying
-                // integer (1-8 bytes per UsmapEnumData.InnerType). Use the same peek heuristic
-                // BytePropertyData.ReadCustom uses for the same ambiguity: if the next 8 bytes
-                // look like a valid FName reference, treat as FName format; otherwise read the
-                // raw integer.
-                if (reader.Asset.HasUnversionedProperties && reader.Asset.Mappings != null
+                // Unversioned enum-in-map has TWO wire formats in the wild — most assets
+                // emit the enum value as an FName (8 bytes; what EnumPropertyData.Read
+                // falls back to in Map context because of its IsNormal() gate), but some
+                // games (e.g. certain UE5.4 titles) emit it as the enum's underlying
+                // integer (1-8 bytes per UsmapEnumData.InnerType). Attempts to auto-detect
+                // the format with byte peeks regressed multiple existing fixtures (the
+                // integer's leading byte plus following property bytes can pass a plausible
+                // FName-shape check), so the integer-format path is opt-in via a
+                // CustomSerializationFlag. Default behavior matches the wider asset
+                // ecosystem; users hitting the integer-format case set the flag.
+                if (reader.Asset.HasUnversionedProperties
+                    && reader.Asset.CustomSerializationFlags.HasFlag(CustomSerializationFlags.UnversionedEnumInMapUseIntegerWireFormat)
+                    && reader.Asset.Mappings != null
                     && reader.Asset.Mappings.TryGetPropertyData(Name, Ancestry, reader.Asset, out UsmapMapData mapDatForEnum)
                     && ((isKey ? mapDatForEnum.InnerType : mapDatForEnum.ValueType) is UsmapEnumData enumDat))
                 {
                     long savedPos = reader.BaseStream.Position;
-                    bool looksLikeFName = false;
-
-                    // Guard the FName-shape peek: if we're near the end of the stream the
-                    // 8-byte read throws (BP_MJJJ_AI_New's CDO has its enum-in-map within a
-                    // few bytes of the property's end). A failed peek means the data can't
-                    // be FName format anyway, so fall through to the integer-read path.
-                    //
-                    // Beyond the basic FName shape check, require the referenced name to
-                    // actually match one of this enum's known value names. Random integer-format
-                    // bytes can pass the basic shape check (the underlying-integer byte plus
-                    // some bytes from the following property happen to make a valid name-map
-                    // index with a zero index), which would silently consume 8 bytes instead
-                    // of 1 and drift downstream reads off the end of the export. Matching the
-                    // peeked name against the enum's value list eliminates that false positive
-                    // for any enum whose values are known in the mappings.
-                    try
+                    string innerTypeName = enumDat.InnerType.Type.ToString();
+                    long? enumIndex = innerTypeName switch
                     {
-                        int peekedNamePointer = reader.ReadInt32();
-                        int peekedNameIndex = reader.ReadInt32();
+                        "ByteProperty" => reader.ReadByte(),
+                        "UInt16Property" => reader.ReadUInt16(),
+                        "UInt32Property" => reader.ReadUInt32(),
+                        "Int8Property" => reader.ReadSByte(),
+                        "Int16Property" => reader.ReadInt16(),
+                        "IntProperty" => reader.ReadInt32(),
+                        "Int64Property" => reader.ReadInt64(),
+                        _ => null
+                    };
 
-                        var nameMapList = reader.Asset.GetNameMapIndexList();
-                        if (peekedNamePointer >= 0 && peekedNamePointer < nameMapList.Count && peekedNameIndex == 0)
+                    if (enumIndex.HasValue)
+                    {
+                        EnumPropertyData enumData = new EnumPropertyData(name);
+                        enumData.Ancestry.Initialize(Ancestry, Name);
+                        enumData.Offset = savedPos;
+                        enumData.PropertyTypeName = PropertyTypeName?.GetParameter(isKey ? 0 : 1);
+                        enumData.EnumType = FName.DefineDummy(reader.Asset, enumDat.Name);
+                        enumData.InnerType = FName.DefineDummy(reader.Asset, innerTypeName);
+
+                        if (reader.Asset.Mappings.EnumMap.TryGetValue(enumData.EnumType.Value.Value, out UsmapEnum enumMapping)
+                            && enumMapping.Values != null
+                            && enumMapping.Values.TryGetValue(enumIndex.Value, out string enumValueName))
                         {
-                            string nameRef = reader.Asset.GetNameReference(peekedNamePointer)?.ToString() ?? string.Empty;
-                            if (!string.IsNullOrEmpty(nameRef) && !nameRef.Contains("/")
-                                && reader.Asset.Mappings.EnumMap.TryGetValue(enumDat.Name, out UsmapEnum peekedEnum)
-                                && peekedEnum.Values != null
-                                && peekedEnum.Values.Values.Contains(nameRef))
-                            {
-                                looksLikeFName = true;
-                            }
+                            enumData.Value = FName.DefineDummy(reader.Asset, enumValueName);
                         }
-                    }
-                    catch
-                    {
-                        // peek ran off the end; not FName format
-                    }
-                    finally
-                    {
-                        reader.BaseStream.Position = savedPos;
-                    }
-
-                    if (!looksLikeFName)
-                    {
-                        string innerTypeName = enumDat.InnerType.Type.ToString();
-                        long? enumIndex = innerTypeName switch
+                        else
                         {
-                            "ByteProperty" => reader.ReadByte(),
-                            "UInt16Property" => reader.ReadUInt16(),
-                            "UInt32Property" => reader.ReadUInt32(),
-                            "Int8Property" => reader.ReadSByte(),
-                            "Int16Property" => reader.ReadInt16(),
-                            "IntProperty" => reader.ReadInt32(),
-                            "Int64Property" => reader.ReadInt64(),
-                            _ => null
-                        };
-
-                        if (enumIndex.HasValue)
-                        {
-                            EnumPropertyData enumData = new EnumPropertyData(name);
-                            enumData.Ancestry.Initialize(Ancestry, Name);
-                            enumData.Offset = savedPos;
-                            enumData.PropertyTypeName = PropertyTypeName?.GetParameter(isKey ? 0 : 1);
-                            enumData.EnumType = FName.DefineDummy(reader.Asset, enumDat.Name);
-                            enumData.InnerType = FName.DefineDummy(reader.Asset, innerTypeName);
-
-                            if (reader.Asset.Mappings.EnumMap.TryGetValue(enumData.EnumType.Value.Value, out UsmapEnum enumMapping)
-                                && enumMapping.Values != null
-                                && enumMapping.Values.TryGetValue(enumIndex.Value, out string enumValueName))
-                            {
-                                enumData.Value = FName.DefineDummy(reader.Asset, enumValueName);
-                            }
-                            else
-                            {
-                                enumData.Value = FName.DefineDummy(reader.Asset, EnumPropertyData.InvalidEnumIndexFallbackPrefix + enumIndex.Value.ToString());
-                            }
-
-                            return enumData;
+                            enumData.Value = FName.DefineDummy(reader.Asset, EnumPropertyData.InvalidEnumIndexFallbackPrefix + enumIndex.Value.ToString());
                         }
+
+                        return enumData;
                     }
                 }
                 goto default;
@@ -288,14 +248,15 @@ public class MapPropertyData : PropertyData
         }
     }
 
-    // Round-trip partner for the heuristic-gated integer read in MapTypeToClass. When the
-    // read path identified the entry as an unversioned underlying-integer enum (EnumType +
-    // InnerType both populated), write it back as the matching integer. The OLD-style FName
-    // path leaves EnumType/InnerType null on EnumPropertyData, so it correctly falls through
-    // to the default Write here.
+    // Round-trip partner for the flag-gated integer read in MapTypeToClass. Same gating
+    // logic — only fires when the asset opts in via UnversionedEnumInMapUseIntegerWireFormat
+    // and the EnumPropertyData was populated by the integer-format read (EnumType +
+    // InnerType both set). Without the flag, falls through to the default entry.Write call
+    // so round-trip stays byte-identical for the existing FName-format ecosystem.
     private static void WriteMapElement(AssetBinaryWriter writer, PropertyData element)
     {
         if (writer.Asset.HasUnversionedProperties
+            && writer.Asset.CustomSerializationFlags.HasFlag(CustomSerializationFlags.UnversionedEnumInMapUseIntegerWireFormat)
             && element is EnumPropertyData enumData
             && enumData.EnumType?.Value?.Value != null
             && enumData.InnerType?.Value?.Value != null)
