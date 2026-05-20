@@ -40,8 +40,25 @@ public class UserDefinedStructExport : StructExport
 
         PropertyData bit;
         var unversionedHeader = new FUnversionedHeader(reader);
-        while ((bit = MainSerializer.Read(reader, null, this.ObjectName, FName.DefineDummy(reader.Asset, reader.Asset.InternalAssetPath), unversionedHeader, true)) != null)
+        bool tolerantParse = reader.Asset.CustomSerializationFlags.HasFlag(CustomSerializationFlags.TolerantPropertyParsing);
+        while (true)
         {
+            long preReadPos = reader.BaseStream.Position;
+            try
+            {
+                bit = MainSerializer.Read(reader, null, this.ObjectName, FName.DefineDummy(reader.Asset, reader.Asset.InternalAssetPath), unversionedHeader, true);
+            }
+            catch when (tolerantParse)
+            {
+                // Property-stream drift in the UserDefinedStruct's StructData. Restore
+                // position to before the failed read and stop the loop; remaining bytes
+                // become the export's Extras via the success path in
+                // ConvertExportToChildExportAndRead.
+                try { reader.BaseStream.Position = preReadPos; } catch { /* swallow */ }
+                break;
+            }
+
+            if (bit == null) break;
             StructData.Add(bit);
         }
     }

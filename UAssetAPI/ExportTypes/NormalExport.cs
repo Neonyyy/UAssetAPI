@@ -36,6 +36,17 @@ namespace UAssetAPI.ExportTypes
         public bool HasLeadingFourNullBytes = false;
 
         /// <summary>
+        /// Set when the property loop was cut short by <see cref="CustomSerializationFlags.TolerantPropertyParsing"/>
+        /// hitting a parse failure. Indicates that <see cref="Data"/> contains only the subset
+        /// of properties that parsed cleanly, with the remaining unparseable bytes preserved
+        /// as <see cref="Export.Extras"/>. These exports should be treated as read-only;
+        /// writing them back regenerates an unversioned header from <see cref="Data"/> alone,
+        /// which won't match the original on-disk layout.
+        /// </summary>
+        [Newtonsoft.Json.JsonIgnore]
+        public bool HasUnparsedPropertyTail = false;
+
+        /// <summary>
         /// Gets or sets the value associated with the specified key. This operation loops linearly, so it may not be suitable for high-performance environments.
         /// </summary>
         /// <param name="key">The key associated with the value to get or set.</param>
@@ -151,13 +162,35 @@ namespace UAssetAPI.ExportTypes
                 }
             }
             FName parentName = GetClassTypeForAncestry(reader.Asset, out FName parentModulePath);
-            while ((bit = MainSerializer.Read(reader, null, parentName, parentModulePath, unversionedHeader, true)) != null)
+            bool tolerantParse = reader.Asset.CustomSerializationFlags.HasFlag(CustomSerializationFlags.TolerantPropertyParsing);
+            while (true)
             {
+                long preReadPos = reader.BaseStream.Position;
+                try
+                {
+                    bit = MainSerializer.Read(reader, null, parentName, parentModulePath, unversionedHeader, true);
+                }
+                catch when (tolerantParse)
+                {
+                    // A property read threw — typically because the usmap-driven property
+                    // layout doesn't match the on-disk bytes (drift). Restore position to
+                    // before the failed read and stop the loop. Remaining bytes will be
+                    // preserved as the export's Extras by ConvertExportToChildExportAndRead's
+                    // success path.
+                    try { reader.BaseStream.Position = preReadPos; } catch { /* swallow */ }
+                    HasUnparsedPropertyTail = true;
+                    break;
+                }
+
+                if (bit == null) break;
                 Data.Add(bit);
             }
 
             ObjectGuid = null;
-            if (!this.ObjectFlags.HasFlag(EObjectFlags.RF_ClassDefaultObject) && reader.ReadBooleanInt()) ObjectGuid = reader.ReadGuid();
+            // Skip the post-property ObjectGuid read when tolerant parsing cut us short —
+            // the stream position is somewhere mid-properties, not at the post-property
+            // section.
+            if (!HasUnparsedPropertyTail && !this.ObjectFlags.HasFlag(EObjectFlags.RF_ClassDefaultObject) && reader.ReadBooleanInt()) ObjectGuid = reader.ReadGuid();
         }
 
         public override void ResolveAncestries(UAsset asset, AncestryInfo ancestrySoFar)

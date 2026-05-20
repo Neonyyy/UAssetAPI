@@ -1,6 +1,4 @@
 using System;
-using System.IO;
-using System.Linq;
 using UAssetAPI.UnrealTypes;
 
 namespace UAssetAPI.PropertyTypes.Objects;
@@ -22,12 +20,12 @@ public class BoolPropertyData : PropertyData<bool>
     {
         if (reader.Asset.HasUnversionedProperties || reader.Asset.ObjectVersionUE5 < ObjectVersionUE5.PROPERTY_TAG_COMPLETE_TYPE_NAME)
         {
-            Value = ReadBooleanByteWithDiagnostics(reader, serializationContext);
+            Value = reader.ReadBooleanByte();
         }
         else
         {
             if (serializationContext is PropertySerializationContext.Map or PropertySerializationContext.Array)
-                Value = ReadBooleanByteWithDiagnostics(reader, serializationContext);
+                Value = reader.ReadBooleanByte();
             else
                 Value = this.PropertyTagFlags.HasFlag(EPropertyTagFlags.BoolTrue);
         }
@@ -35,68 +33,6 @@ public class BoolPropertyData : PropertyData<bool>
         {
             this.ReadEndPropertyTag(reader);
         }
-    }
-
-    // Wraps reader.ReadBooleanByte() so that when the byte at the stream position isn't 0 or
-    // 1, we capture a hexdump of ~32 bytes around the failed position into the asset's
-    // parse-errors.log before re-throwing. Lets us see what's actually at the mis-aligned
-    // read site for diagnostic purposes (e.g. BP_MJJJ_AI_New dep CDOs reporting "Invalid
-    // boolean value 19" / "35") without rebuilding with DEBUGVERBOSE.
-    private bool ReadBooleanByteWithDiagnostics(AssetBinaryReader reader, PropertySerializationContext serializationContext)
-    {
-        try
-        {
-            return reader.ReadBooleanByte();
-        }
-        catch (FormatException) when (reader.Asset != null && !string.IsNullOrEmpty(reader.Asset.FilePath))
-        {
-            TryWriteBoolFailureHexdump(reader, serializationContext);
-            throw;
-        }
-    }
-
-    private void TryWriteBoolFailureHexdump(AssetBinaryReader reader, PropertySerializationContext serializationContext)
-    {
-        try
-        {
-            long failedPos = reader.BaseStream.Position; // already 1 past the bad byte
-            long badBytePos = failedPos - 1;
-            long startPos = Math.Max(0, badBytePos - 16);
-            long endPos = Math.Min(reader.BaseStream.Length, badBytePos + 17);
-            int countToRead = (int)(endPos - startPos);
-            if (countToRead <= 0) return;
-
-            long savedPos = reader.BaseStream.Position;
-            try
-            {
-                reader.BaseStream.Position = startPos;
-                byte[] context = new byte[countToRead];
-                int got = reader.BaseStream.Read(context, 0, countToRead);
-
-                var parts = Enumerable.Range(0, got).Select(i =>
-                {
-                    long abs = startPos + i;
-                    string hex = context[i].ToString("X2");
-                    return abs == badBytePos ? "[" + hex + "]" : hex;
-                });
-                string hexdump = string.Join(" ", parts);
-
-                string logPath = reader.Asset.FilePath + ".parse-errors.log";
-                string contextTag = reader.Asset.IsParsingToPullSchemas ? " [during schema pull]" : string.Empty;
-                string propName = Name?.ToString() ?? "?";
-                File.AppendAllText(logPath,
-                    "[" + DateTime.Now.ToString("O") + "]" + contextTag +
-                    " BoolProperty misaligned read on property '" + propName + "'" +
-                    " (serializationContext=" + serializationContext +
-                    ", bad byte at file offset 0x" + badBytePos.ToString("X") + "): " +
-                    hexdump + "\n\n");
-            }
-            finally
-            {
-                reader.BaseStream.Position = savedPos;
-            }
-        }
-        catch { /* swallow logging failures */ }
     }
 
     public override int Write(AssetBinaryWriter writer, bool includeHeader, PropertySerializationContext serializationContext = PropertySerializationContext.Normal)

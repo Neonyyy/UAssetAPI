@@ -123,6 +123,21 @@ namespace UAssetAPI
         /// FName-shaped format.
         /// </summary>
         UnversionedEnumInMapUseIntegerWireFormat = 32,
+
+        /// <summary>
+        /// When parsing an unversioned NormalExport's property stream, if any individual
+        /// property read throws (typically due to schema/usmap mismatch causing stream
+        /// drift), stop the property loop instead of failing the whole export. The
+        /// successfully-parsed properties are kept in <c>Data</c>; the remaining bytes are
+        /// preserved as the export's <c>Extras</c> for round-trip safety.
+        /// <para>
+        /// Trade-off: a partially-parsed export's <c>Data</c> is for *display only* — its
+        /// <see cref="ExportTypes.NormalExport.Write"/> regenerates an unversioned header
+        /// from the parsed properties alone, which doesn't reconstruct the original layout.
+        /// Edits to the parsed properties of such an export are not safe to write back.
+        /// </para>
+        /// </summary>
+        TolerantPropertyParsing = 64,
     }
 
 
@@ -1140,24 +1155,6 @@ namespace UAssetAPI
 #if DEBUGVERBOSE
                 Console.WriteLine("\nFailed to parse export " + (i + 1) + ": " + ex.ToString());
 #endif
-                // Diagnostic: write the exception to <asset_path>.parse-errors.log. We log
-                // BOTH top-level reads AND nested schema-pull reads (IsParsingToPullSchemas
-                // is true for the latter) — a schema-pull silently dropping exceptions makes
-                // it impossible to tell when the user's actual asset is failing because a
-                // *dependency* couldn't parse. Each pulled asset gets its own log next to it,
-                // and the dependent asset's log will only fire if it has its own failure.
-                if (read && !string.IsNullOrEmpty(FilePath))
-                {
-                    try
-                    {
-                        string logPath = FilePath + ".parse-errors.log";
-                        string objName = Exports[i]?.ObjectName?.ToString() ?? "?";
-                        string contextTag = IsParsingToPullSchemas ? " [during schema pull]" : string.Empty;
-                        File.AppendAllText(logPath, "[" + DateTime.Now.ToString("O") + "]" + contextTag + " Export " + (i + 1) + " (" + objName + "): " + ex.ToString() + "\n\n");
-                    }
-                    catch { /* swallow */ }
-                }
-
                 long nextStarting;
                 if ((Exports.Count - 1) > i)
                 {
